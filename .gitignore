@@ -1,0 +1,7 @@
+backups/
+dist/
+test-output/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
