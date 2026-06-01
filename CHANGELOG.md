@@ -1,12 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Match restored records to the current template thread's `model_provider` instead of hard-coding `codex_local_access`.
-- Refresh `session_index.jsonl` and `.codex-global-state.json` after restore/import so account-switch recoveries appear in the Desktop sidebar.
-- Include sidebar state files in restore/import backups.
-- List user Desktop threads regardless of `has_user_event`, matching newer Codex Desktop behavior.
-
 ## 0.2.0
 
 - Added WinForms GUI workflow for normal Windows users.

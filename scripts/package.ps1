@@ -24,6 +24,7 @@ $items = @(
     "Restore-CodexHistory.ps1",
     "run.bat",
     "run-cli.bat",
+    "run-gui-hidden.vbs",
     "docs",
     "tools"
 )

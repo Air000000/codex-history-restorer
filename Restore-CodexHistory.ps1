@@ -13,8 +13,7 @@ param(
     [switch] $ListBackups,
     [string] $RollbackBackup = "",
     [switch] $DryRun,
-    [switch] $NoTouch,
-    [switch] $NoSidebarSync
+    [switch] $NoTouch
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,7 +82,6 @@ $template = Get-CHRTemplate -Database $dbPath -RequestedThreadId $TemplateThread
 
 Write-CHRInfo "Codex home: $CodexHome"
 Write-CHRInfo "Template thread: $($template.Id)"
-Write-CHRInfo "Current model provider: $($template.ModelProvider)"
 if ($ProjectRoot) { Write-CHRInfo "Project root: $projectJsonCwd" }
 $envInfo = Test-CHREnvironment -CodexHome $CodexHome
 if ($envInfo.DesktopRunning) {
@@ -100,14 +98,10 @@ if ($ImportSessions) {
         Write-CHRInfo "Pre-import database backup created: $importBackup"
         $result = Import-CHRJsonlSessions -Database $dbPath -CodexHome $CodexHome -SessionsDir $SourceSessionsDir -ProjectDbCwd $projectDbCwd -ProjectJsonCwd $projectJsonCwd -Template $template
         Write-CHRInfo "Imported $(@($result.Imported).Count) new JSONL session file(s). Existing=$($result.Existing) Invalid=$($result.Invalid)."
-        if (-not $NoSidebarSync) {
-            $sync = Sync-CHRSidebarState -Database $dbPath -CodexHome $CodexHome -CurrentModelProvider $template.ModelProvider
-            Write-CHRInfo "Sidebar index synced: threads=$($sync.ThreadCount) provider=$($sync.ModelProvider)"
-        }
     }
 }
 
-$rows = @(Get-CHRThreadRows -Database $dbPath -ProjectDbCwd $projectDbCwd -CurrentModelProvider $template.ModelProvider -OldOnly:$OnlyOld)
+$rows = @(Get-CHRThreadRows -Database $dbPath -ProjectDbCwd $projectDbCwd -OldOnly:$OnlyOld)
 if ($rows.Count -eq 0) {
     Write-CHRInfo "No matching threads found."
     exit 0
@@ -158,10 +152,6 @@ Write-CHRInfo "Backup created: $backup"
 
 Invoke-CHRSqlite -Database $dbPath -Sql "pragma wal_checkpoint(full);" | Out-Null
 $changed = Repair-CHRThreads -Database $dbPath -Rows $selected -ProjectDbCwd $projectDbCwd -ProjectJsonCwd $projectJsonCwd -Template $template -NoTouch:$NoTouch
-if (-not $NoSidebarSync) {
-    $sync = Sync-CHRSidebarState -Database $dbPath -CodexHome $CodexHome -CurrentModelProvider $template.ModelProvider
-    Write-CHRInfo "Sidebar index synced: threads=$($sync.ThreadCount) provider=$($sync.ModelProvider)"
-}
 
 Write-Host ""
 Write-CHRInfo "Restored $(@($changed).Count) thread(s)."

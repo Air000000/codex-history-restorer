@@ -1,5 +1,4 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Restore-CodexHistory-GUI.ps1"
-pause
+wscript.exe "%~dp0run-gui-hidden.vbs"

@@ -1,122 +1,198 @@
 # Codex History Restorer
 
-A small Windows tool for restoring local Codex Desktop chat history.
+![Platform](https://img.shields.io/badge/platform-Windows-0078D6)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
+![GUI](https://img.shields.io/badge/UI-WinForms-2EA44F)
+![Privacy](https://img.shields.io/badge/privacy-local--only-6F42C1)
+![Release](https://img.shields.io/badge/release-zip-blue)
+![License](https://img.shields.io/badge/license-MIT-yellow)
 
-It helps when your old conversations still exist under `%USERPROFILE%\.codex`, but do not show up after switching accounts, updating Codex, importing sessions, or refreshing the sidebar.
+A local Windows tool for restoring Codex Desktop conversations that still exist on disk but no longer appear in the app.
 
-The safest and easiest way to use it is to give this folder to an AI coding agent and let it run the restore carefully.
+It repairs Codex history metadata, imports recoverable `rollout-*.jsonl` files from old sessions or backups, and creates backups before writing anything.
 
-## Recommended: Let an AI Agent Use It
+## Download
 
-Copy this prompt into Codex, ChatGPT with local tools, Cursor, or another local coding agent:
-
-```text
-I lost Codex Desktop chat history after switching accounts or updating Codex.
-Please use this local tool:
-
-<path-to-codex-history-restorer>
-
-Please:
-1. Inspect the tool and my current Codex data first.
-2. Run a dry run before changing anything.
-3. Create or confirm a backup before restore.
-4. Restore the missing chats.
-5. If they still do not appear, handle provider/account mismatch and refresh the sidebar indexes.
-6. Tell me what changed and where the backup is.
-```
-
-This works well because account-switch recovery is often a little fiddly: the chats may need database repair, JSONL metadata repair, and sidebar index refresh.
-
-## Manual Use
-
-### GUI
-
-Double-click:
+Download the latest release zip from GitHub Releases, extract it, then double-click:
 
 ```text
 run.bat
 ```
 
-Then:
+Do not download individual `.ps1` files unless you already know how to run PowerShell scripts. The release zip contains the GUI, CLI, docs, and helper files in the right layout.
 
-1. Choose the project.
-2. Load records.
-3. Preview hidden or old records.
-4. Restore selected records.
+## Quick Start
 
-Use `More tools...` for importing sessions, finding source folders, or rollback.
+1. Double-click `run.bat`.
+2. Click `Find recoverable records`.
+3. If external sources are found, review the title previews and import the sources you trust.
+4. Click `Select repairable`, or tick rows manually.
+5. Click `Restore selected`.
+6. Return to Codex Desktop, switch projects or restart Codex, then check the restored chats.
 
-### CLI
+The GUI follows your Windows language by default and includes a language selector.
 
-List records:
+Most users do not need to change project settings. Leave project override empty to keep each chat under its original project.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "D:\Projects\Example" -ListOnly
-```
+## Privacy And Safety
 
-Preview:
+This tool runs locally.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "D:\Projects\Example" -Numbers 1,2,3 -DryRun
-```
+- It does not upload chat history.
+- It does not call any network API.
+- It does not delete backups automatically.
+- It asks for confirmation before import, restore, or rollback.
+- It creates a timestamped backup before writing.
 
-Restore:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "D:\Projects\Example" -Numbers 1,2,3
-```
-
-Import sessions from another Codex folder:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "D:\Projects\Example" -SourceSessionsDir "D:\Backup\.codex\sessions" -ImportSessions -RestoreAll
-```
-
-## What It Repairs
-
-- hidden or old thread records in `state_5.sqlite`
-- stale `session_meta` in `rollout-*.jsonl`
-- account/provider mismatch after switching accounts
-- missing Desktop tool metadata
-- stale `session_index.jsonl` and `.codex-global-state.json`
-
-The tool matches restored chats to your current visible Codex Desktop metadata, so old and new account formats can both be handled.
-
-## Safety
-
-- Runs locally only.
-- Does not upload chat history.
-- Creates a timestamped backup before writing.
-- Supports dry run and rollback.
-
-Backups are saved by default to:
+Default backup location:
 
 ```text
 %USERPROFILE%\Documents\CodexHistoryRestorerBackups
 ```
 
-Close Codex Desktop before large imports or rollback if possible.
+SQLite writes are grouped in transactions where possible. JSONL files are written through temporary files before replacement. If something still fails midway, use `Backups / Rollback` in the GUI.
+
+## What It Can Fix
+
+Codex Desktop stores local history in two places:
+
+- `%USERPROFILE%\.codex\state_5.sqlite`
+- `%USERPROFILE%\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl`
+
+When chats are still present locally but do not appear in Codex Desktop, the usual cause is incomplete or outdated metadata. The GUI marks these rows as `Needs repair`.
+
+The tool can repair:
+
+- Missing or outdated `thread_source`
+- Mismatched `model_provider`
+- Missing Desktop `dynamic_tools`
+- Outdated JSONL first-line `session_meta`
+- Old `updated_at_ms` values that keep restored chats low in the list
+- Local sessions that exist in old `.codex\sessions`, archived sessions, VS Code/Cursor storage, or backup folders but are not yet in the current Codex database
+
+## What It Cannot Fix
+
+The tool cannot recover chats when:
+
+- The local JSONL/session files are gone.
+- The JSONL files are corrupted beyond parsing.
+- The chat only exists in another account's cloud state.
+- The current Codex app has no visible chat to use as a metadata template.
+- A future Codex version changes the database format in an incompatible way.
+
+If no template chat is found, create one normal chat in Codex Desktop, then run the tool again.
+
+## Source Discovery
+
+`Find recoverable records` scans common local locations:
+
+- Current Codex sessions
+- Codex archived sessions
+- VS Code and Cursor global storage
+- Documents and Downloads
+- The configured backup folder
+- A manually selected external sessions folder
+
+External sources are not imported automatically. The GUI shows source type, counts, and title previews first; only checked sources are imported after confirmation.
+
+## Advanced CLI Usage
+
+For command-line use, double-click `run-cli.bat` or run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1
+```
+
+List candidate records for a project:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "C:\path\to\your\project" -ListOnly
+```
+
+Preview a restore:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "C:\path\to\your\project" -Numbers 6,7,8 -DryRun
+```
+
+Restore selected records:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "C:\path\to\your\project" -Numbers 6,7,8
+```
+
+Import JSONL files from another sessions folder, then repair them:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ProjectRoot "C:\path\to\your\project" -SourceSessionsDir "D:\path\to\backup\.codex\sessions" -ImportSessions -RestoreAll
+```
+
+List backups:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -ListBackups
+```
+
+Rollback from a backup:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Restore-CodexHistory.ps1 -RollbackBackup "C:\Users\You\Documents\CodexHistoryRestorerBackups\codex-history-restore-backup-20260524-120000"
+```
+
+## CLI Options
+
+| Option | Purpose |
+| --- | --- |
+| `-ProjectRoot` | Optional project folder override. Leave empty to keep original projects. |
+| `-ListOnly` | List matching threads and exit. |
+| `-Numbers` | Restore records by list number, e.g. `-Numbers 1,2,5`. |
+| `-ThreadIds` | Restore records by Codex thread id. |
+| `-RestoreAll` | Restore all matching listed records. |
+| `-OnlyOld` | Only restore records marked as old metadata. |
+| `-ListBackups` | List manifest-based backups. |
+| `-RollbackBackup` | Restore files from a backup directory. |
+| `-SourceSessionsDir` | External `sessions` folder containing `rollout-*.jsonl`. |
+| `-ImportSessions` | Import JSONL files into the current Codex database before repairing. |
+| `-BackupRoot` | Custom backup directory. |
+| `-TemplateThreadId` | Use a specific visible Desktop thread as metadata template. |
+| `-NoTouch` | Do not update `updated_at_ms`. Restored records may remain low in the UI list. |
+| `-DryRun` | Preview actions without writing. |
 
 ## Requirements
 
-- Windows
-- PowerShell 5.1 or newer
-- Codex Desktop
-- `sqlite3.exe` in `PATH` or `tools\sqlite3.exe`
-- At least one visible Codex Desktop conversation, used as a template
+- Windows PowerShell 5.1 or PowerShell 7+
+- `sqlite3.exe` in `tools\sqlite3.exe` or available in `PATH`
+- Codex Desktop with at least one visible conversation
+
+The release does not bundle `sqlite3.exe`. See `tools\README.md` for where to place a portable copy.
+
+## Project Files
+
+- `run.bat`: normal GUI launcher
+- `run-cli.bat`: CLI launcher
+- `run-gui-hidden.vbs`: hides the PowerShell window when launching the GUI
+- `Restore-CodexHistory-GUI.ps1`: WinForms GUI
+- `Restore-CodexHistory.ps1`: CLI wrapper
+- `CodexHistoryRestorer.Core.psm1`: shared restore/import/backup logic
+- `scripts\package.ps1`: creates the release zip
+- `tests\Run-SmokeTests.ps1`: fake `.codex` smoke tests
 
 ## Development
 
-Run tests:
+Run smoke tests:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tests\Run-SmokeTests.ps1
 ```
 
-Create release zip:
+Create a release zip:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-More troubleshooting notes are in `docs\troubleshooting.md`.
+The zip is written to `dist\`.
+
+## Troubleshooting
+
+See [docs/troubleshooting.md](docs/troubleshooting.md).

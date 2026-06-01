@@ -145,7 +145,6 @@ function Get-CHRDesktopProcesses {
     $processes = @()
     try {
         $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            ($_.Name -match "^(Codex|codex)\.exe$") -or
             ($_.ExecutablePath -and $_.ExecutablePath -match "OpenAI\\Codex|OpenAI\.Codex|\\Codex\\")
         } | Select-Object ProcessId, Name, ExecutablePath)
     } catch {
@@ -174,7 +173,7 @@ function Test-CHREnvironment {
             $templateOk = $true
         } catch { [void]$errors.Add($_.Exception.Message) }
     }
-    $desktopProcesses = @(Get-CHRDesktopProcesses)
+    $desktopProcesses = @()
     return [pscustomobject]@{
         CodexHome = $CodexHome
         Database = $dbPath
@@ -184,7 +183,7 @@ function Test-CHREnvironment {
         TemplateOk = $templateOk
         TemplateThreadId = if ($template) { $template.Id } else { "" }
         DesktopProcesses = $desktopProcesses
-        DesktopRunning = ($desktopProcesses.Count -gt 0)
+        DesktopRunning = $false
         Errors = @($errors)
         Ok = ($errors.Count -eq 0)
     }
@@ -199,8 +198,6 @@ select t.id
 from threads t
 join thread_dynamic_tools d on d.thread_id = t.id
 where coalesce(t.thread_source, '') = 'user'
-  and t.source = 'vscode'
-  and t.archived = 0
 group by t.id
 having count(d.thread_id) > 0
 order by t.updated_at_ms desc, t.id desc
@@ -215,16 +212,10 @@ limit 1;
     $cli = $meta.payload.cli_version
     if (-not $cli) { $cli = (Invoke-CHRSqlite -Database $Database -Sql "select cli_version from threads where id=$(Quote-CHRSql $id);").Trim() }
     if (-not $cli) { $cli = "0.133.0-alpha.1" }
-    $provider = (Invoke-CHRSqlite -Database $Database -Sql "select model_provider from threads where id=$(Quote-CHRSql $id);").Trim()
+    $provider = (Invoke-CHRSqlite -Database $Database -Sql "select coalesce(model_provider,'') from threads where id=$(Quote-CHRSql $id);").Trim()
     if (-not $provider) { $provider = $meta.payload.model_provider }
-    if (-not $provider) { $provider = "codex_local_access" }
-    return [pscustomobject]@{
-        Id = $id
-        Path = $path
-        CliVersion = $cli
-        ModelProvider = $provider
-        DynamicTools = @($meta.payload.dynamic_tools)
-    }
+    if (-not $provider) { $provider = "openai" }
+    return [pscustomobject]@{ Id = $id; Path = $path; CliVersion = $cli; ModelProvider = $provider; DynamicTools = @($meta.payload.dynamic_tools) }
 }
 
 function Get-CHRProjects {
@@ -232,7 +223,7 @@ function Get-CHRProjects {
     $sql = @"
 select cwd, count(*) as count
 from threads
-where archived=0 and thread_source='user' and source='vscode'
+where archived=0 and has_user_event=1
 group by cwd
 order by max(updated_at_ms) desc;
 "@
@@ -304,18 +295,10 @@ function Find-CHRSources {
 }
 
 function Get-CHRThreadRows {
-    param(
-        [Parameter(Mandatory = $true)] [string] $Database,
-        [string] $ProjectDbCwd = "",
-        [string] $CurrentModelProvider = "",
-        [switch] $OldOnly
-    )
-    if (-not $CurrentModelProvider) {
-        try { $CurrentModelProvider = (Get-CHRTemplate -Database $Database).ModelProvider } catch { $CurrentModelProvider = "codex_local_access" }
-    }
-    $where = "archived=0 and thread_source='user' and source='vscode'"
-    if ($ProjectDbCwd) { $where += " and cwd=$(Quote-CHRSql $ProjectDbCwd)" }
-    if ($OldOnly) { $where += " and model_provider <> $(Quote-CHRSql $CurrentModelProvider)" }
+    param([Parameter(Mandatory = $true)] [string] $Database, [string] $ProjectDbCwd = "", [switch] $OldOnly)
+    $where = "t.archived=0 and t.has_user_event=1"
+    if ($ProjectDbCwd) { $where += " and t.cwd=$(Quote-CHRSql $ProjectDbCwd)" }
+    if ($OldOnly) { $where += " and (coalesce(t.thread_source,'') <> 'user' or coalesce(d.tool_count,0) <= 0)" }
     $sql = @"
 select
   id,
@@ -324,19 +307,25 @@ select
   coalesce(thread_source, '') as thread_source,
   model_provider,
   coalesce(cli_version, '') as cli_version,
-  updated_at_ms
-from threads
+  updated_at_ms,
+  coalesce(d.tool_count, 0) as tool_count
+from threads t
+left join (
+  select thread_id, count(*) as tool_count
+  from thread_dynamic_tools
+  group by thread_id
+) d on d.thread_id = t.id
 where $where
-order by updated_at_ms desc, id desc;
+order by t.updated_at_ms desc, t.id desc;
 "@
     $raw = Invoke-CHRSqlite -Database $Database -Sql $sql -Separator "`t"
     $rows = @()
     $number = 1
     foreach ($line in $raw) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $parts = $line -split "`t", 7
-        if ($parts.Count -lt 7) { continue }
-        $status = if ($parts[3] -eq "user" -and $parts[4] -eq $CurrentModelProvider) { "desktop" } else { "old" }
+        $parts = $line -split "`t", 8
+        if ($parts.Count -lt 8) { continue }
+        $status = if ($parts[3] -eq "user" -and ([int]$parts[7]) -gt 0) { "desktop" } else { "old" }
         $rows += [pscustomobject]@{
             Number = $number
             Id = $parts[0]
@@ -348,6 +337,7 @@ order by updated_at_ms desc, id desc;
             UpdatedAtMs = [int64]$parts[6]
             UpdatedAt = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$parts[6]).LocalDateTime
             Status = $status
+            ToolCount = [int]$parts[7]
         }
         $number++
     }
@@ -403,6 +393,28 @@ function Get-CHRSafeDestination {
     return $dest
 }
 
+function Write-CHRAllLinesAtomic {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string[]] $Lines
+    )
+    $tmp = "$Path.chr-tmp-$([guid]::NewGuid().ToString('N'))"
+    [System.IO.File]::WriteAllLines($tmp, $Lines, [System.Text.UTF8Encoding]::new($false))
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            try {
+                [System.IO.File]::Replace($tmp, $Path, $null)
+            } catch {
+                Move-Item -LiteralPath $tmp -Destination $Path -Force
+            }
+        } else {
+            Move-Item -LiteralPath $tmp -Destination $Path -Force
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    }
+}
+
 function Import-CHRJsonlSessions {
     param(
         [Parameter(Mandatory = $true)] [string] $Database,
@@ -414,6 +426,7 @@ function Import-CHRJsonlSessions {
     )
     $scan = Test-CHRImportSessions -Database $Database -SessionsDir $SessionsDir
     $imported = @()
+    $insertSql = New-Object System.Collections.Generic.List[string]
     foreach ($item in @($scan.Items | Where-Object { $_.Status -eq "Importable" })) {
         $file = Get-Item -LiteralPath $item.Path
         $meta = Get-CHRSessionMeta -Path $file.FullName
@@ -440,7 +453,7 @@ insert into threads (
   $sec,
   $sec,
   'vscode',
-  $(Quote-CHRSql $Template.ModelProvider),
+  'codex_local_access',
   $(Quote-CHRSql $dbCwd),
   $(Quote-CHRSql $title),
   $(Quote-CHRSql '{"type":"workspace-write","network_access":false,"exclude_tmpdir_env_var":false,"exclude_slash_tmp":false}'),
@@ -459,8 +472,18 @@ insert into threads (
   $(Quote-CHRSql $title)
 );
 "@
-        Invoke-CHRSqlite -Database $Database -Sql $insert | Out-Null
+        [void]$insertSql.Add($insert)
         $imported += [pscustomobject]@{ Id = $id; Path = $dest; Title = $title }
+    }
+    if ($insertSql.Count -gt 0) {
+        try {
+            Invoke-CHRSqlite -Database $Database -Sql (".bail on`nbegin immediate;`n" + (($insertSql.ToArray()) -join "`n") + "`ncommit;") | Out-Null
+        } catch {
+            foreach ($item in $imported) {
+                if (Test-Path -LiteralPath $item.Path) { Remove-Item -LiteralPath $item.Path -Force -ErrorAction SilentlyContinue }
+            }
+            throw
+        }
     }
     return [pscustomobject]@{ Imported = @($imported); Skipped = @($scan.Items | Where-Object { $_.Status -ne "Importable" }); Scanned = $scan.Scanned; Existing = $scan.Existing; Invalid = $scan.Invalid }
 }
@@ -484,16 +507,6 @@ function New-CHRBackup {
             $name = Split-Path -Leaf $dbFile
             Copy-Item -LiteralPath $dbFile -Destination (Join-Path $dir $name) -Force
             $files += [pscustomobject]@{ Kind = "database"; OriginalPath = $dbFile; BackupFile = $name }
-        }
-    }
-    foreach ($stateFile in @(
-        (Join-Path $CodexHome "session_index.jsonl"),
-        (Join-Path $CodexHome ".codex-global-state.json")
-    )) {
-        if (Test-Path -LiteralPath $stateFile) {
-            $name = Split-Path -Leaf $stateFile
-            Copy-Item -LiteralPath $stateFile -Destination (Join-Path $dir $name) -Force
-            $files += [pscustomobject]@{ Kind = "state"; OriginalPath = $stateFile; BackupFile = $name }
         }
     }
     foreach ($path in @($JsonlPaths | Sort-Object -Unique)) {
@@ -563,135 +576,6 @@ function Restore-CHRBackup {
     return [pscustomobject]@{ Restored = @($manifest.Files).Count; BackupPath = $BackupPath; Operation = $manifest.Operation }
 }
 
-function Add-CHRUniqueString {
-    param(
-        [Parameter(Mandatory = $true)] $List,
-        [string] $Value
-    )
-    if ($Value -and -not $List.Contains($Value)) { [void]$List.Add($Value) }
-}
-
-function Test-CHRPathStartsWith {
-    param([string] $Path, [string[]] $Roots)
-    foreach ($root in $Roots) {
-        if ($Path -and $root -and $Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-    }
-    return $false
-}
-
-function Sync-CHRSidebarState {
-    param(
-        [Parameter(Mandatory = $true)] [string] $Database,
-        [Parameter(Mandatory = $true)] [string] $CodexHome,
-        [string] $CurrentModelProvider = "",
-        [switch] $SkipSessionIndex,
-        [switch] $SkipGlobalState
-    )
-    if (-not $CurrentModelProvider) {
-        try { $CurrentModelProvider = (Get-CHRTemplate -Database $Database).ModelProvider } catch { $CurrentModelProvider = "" }
-    }
-
-    $where = "archived=0 and thread_source='user' and source='vscode'"
-    if ($CurrentModelProvider) { $where += " and model_provider=$(Quote-CHRSql $CurrentModelProvider)" }
-    $sql = @"
-select
-  id,
-  coalesce(nullif(replace(replace(replace(title, char(13), ' '), char(10), ' '), char(9), ' '), ''), nullif(preview, ''), nullif(first_user_message, ''), id) as title,
-  cwd,
-  coalesce(updated_at_ms, updated_at * 1000, created_at_ms, created_at * 1000, 0) as updated_at_ms
-from threads
-where $where
-order by updated_at_ms asc, id asc;
-"@
-    $raw = Invoke-CHRSqlite -Database $Database -Sql $sql -Separator "`t"
-    $threads = @()
-    foreach ($line in $raw) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $parts = $line -split "`t", 4
-        if ($parts.Count -lt 4) { continue }
-        $threads += [pscustomobject]@{
-            Id = $parts[0]
-            Title = $parts[1]
-            Cwd = ($parts[2] -replace "^\\\\\?\\", "")
-            UpdatedMs = [int64]$parts[3]
-        }
-    }
-
-    $indexPath = Join-Path $CodexHome "session_index.jsonl"
-    if (-not $SkipSessionIndex) {
-        $indexLines = foreach ($thread in $threads) {
-            $ms = if ($thread.UpdatedMs -gt 0) { $thread.UpdatedMs } else { [DateTimeOffset]::Now.ToUnixTimeMilliseconds() }
-            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($ms).UtcDateTime
-            [pscustomobject]@{
-                id = $thread.Id
-                thread_name = $thread.Title
-                updated_at = $dt.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", [Globalization.CultureInfo]::InvariantCulture)
-            } | ConvertTo-Json -Compress -Depth 10
-        }
-        [System.IO.File]::WriteAllLines($indexPath, [string[]]$indexLines, [System.Text.UTF8Encoding]::new($false))
-    }
-
-    $statePath = Join-Path $CodexHome ".codex-global-state.json"
-    if (-not $SkipGlobalState) {
-        if (Test-Path -LiteralPath $statePath) {
-            $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-        } else {
-            $state = [pscustomobject]@{}
-        }
-        if ($state.PSObject.Properties.Name -notcontains "thread-workspace-root-hints") { $state | Add-Member -NotePropertyName "thread-workspace-root-hints" -NotePropertyValue ([pscustomobject]@{}) }
-        if ($state.PSObject.Properties.Name -notcontains "projectless-thread-ids") { $state | Add-Member -NotePropertyName "projectless-thread-ids" -NotePropertyValue @() }
-        if ($state.PSObject.Properties.Name -notcontains "project-order") { $state | Add-Member -NotePropertyName "project-order" -NotePropertyValue @() }
-        if ($state.PSObject.Properties.Name -notcontains "electron-saved-workspace-roots") { $state | Add-Member -NotePropertyName "electron-saved-workspace-roots" -NotePropertyValue @() }
-
-        $docsRoots = @(
-            (Join-Path $env:USERPROFILE "Documents\Codex"),
-            (Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Codex")
-        ) | Select-Object -Unique
-        $projectlessRoot = Join-Path $env:USERPROFILE "Documents\Codex"
-        $hintObj = $state."thread-workspace-root-hints"
-
-        $projectless = [System.Collections.Generic.List[string]]::new()
-        foreach ($id in @($state."projectless-thread-ids")) { Add-CHRUniqueString -List $projectless -Value $id }
-
-        $projects = [System.Collections.Generic.List[string]]::new()
-        foreach ($path in @($state."project-order")) {
-            if (-not (Test-CHRPathStartsWith -Path $path -Roots $docsRoots)) { Add-CHRUniqueString -List $projects -Value $path }
-        }
-
-        $savedRoots = [System.Collections.Generic.List[string]]::new()
-        foreach ($path in @($state."electron-saved-workspace-roots")) {
-            if (-not (Test-CHRPathStartsWith -Path $path -Roots $docsRoots)) { Add-CHRUniqueString -List $savedRoots -Value $path }
-        }
-
-        foreach ($thread in $threads) {
-            $root = $thread.Cwd
-            if (Test-CHRPathStartsWith -Path $thread.Cwd -Roots $docsRoots) {
-                $root = $projectlessRoot
-                Add-CHRUniqueString -List $projectless -Value $thread.Id
-            } else {
-                Add-CHRUniqueString -List $projects -Value $root
-                Add-CHRUniqueString -List $savedRoots -Value $root
-            }
-
-            $prop = $hintObj.PSObject.Properties[$thread.Id]
-            if ($prop) { $prop.Value = $root }
-            else { $hintObj | Add-Member -NotePropertyName $thread.Id -NotePropertyValue $root }
-        }
-
-        $state."projectless-thread-ids" = [string[]]$projectless
-        $state."project-order" = [string[]]$projects
-        $state."electron-saved-workspace-roots" = [string[]]$savedRoots
-        [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 100 -Compress), [System.Text.UTF8Encoding]::new($false))
-    }
-
-    return [pscustomobject]@{
-        ThreadCount = @($threads).Count
-        ModelProvider = $CurrentModelProvider
-        SessionIndexPath = $indexPath
-        GlobalStatePath = $statePath
-    }
-}
-
 function Repair-CHRThreads {
     param(
         [Parameter(Mandatory = $true)] [string] $Database,
@@ -704,11 +588,14 @@ function Repair-CHRThreads {
     $baseMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
     $offset = 0
     $changed = @()
+    $dbStatements = New-Object System.Collections.Generic.List[string]
+    $jsonUpdates = @()
     foreach ($row in $Rows) {
         $id = $row.Id
         $rollout = (Invoke-CHRSqlite -Database $Database -Sql "select rollout_path from threads where id=$(Quote-CHRSql $id);").Trim()
         if (-not (Test-Path -LiteralPath $rollout)) { throw "Rollout file not found for ${id}: $rollout" }
-        $updates = @("source='vscode'", "thread_source='user'", "model_provider=$(Quote-CHRSql $Template.ModelProvider)", "cli_version=$(Quote-CHRSql $Template.CliVersion)", "has_user_event=1", "archived=0")
+        $provider = if ($Template.ModelProvider) { $Template.ModelProvider } else { "openai" }
+        $updates = @("source='vscode'", "thread_source='user'", "model_provider=$(Quote-CHRSql $provider)", "cli_version=$(Quote-CHRSql $Template.CliVersion)", "has_user_event=1", "archived=0")
         if ($ProjectDbCwd) { $updates += "cwd=$(Quote-CHRSql $ProjectDbCwd)" }
         if (-not $NoTouch) {
             $ms = $baseMs + $offset
@@ -717,20 +604,26 @@ function Repair-CHRThreads {
             $updates += "updated_at_ms=$ms"
             $offset++
         }
-        Invoke-CHRSqlite -Database $Database -Sql "update threads set $($updates -join ', ') where id=$(Quote-CHRSql $id);" | Out-Null
-        Invoke-CHRSqlite -Database $Database -Sql "delete from thread_dynamic_tools where thread_id=$(Quote-CHRSql $id);" | Out-Null
-        Invoke-CHRSqlite -Database $Database -Sql "insert into thread_dynamic_tools(thread_id, position, name, description, input_schema, defer_loading, namespace) select $(Quote-CHRSql $id), position, name, description, input_schema, defer_loading, namespace from thread_dynamic_tools where thread_id=$(Quote-CHRSql $Template.Id);" | Out-Null
+        [void]$dbStatements.Add("update threads set $($updates -join ', ') where id=$(Quote-CHRSql $id);")
+        [void]$dbStatements.Add("delete from thread_dynamic_tools where thread_id=$(Quote-CHRSql $id);")
+        [void]$dbStatements.Add("insert into thread_dynamic_tools(thread_id, position, name, description, input_schema, defer_loading, namespace) select $(Quote-CHRSql $id), position, name, description, input_schema, defer_loading, namespace from thread_dynamic_tools where thread_id=$(Quote-CHRSql $Template.Id);")
         $lines = [System.IO.File]::ReadAllLines($rollout, [System.Text.Encoding]::UTF8)
         $meta = $lines[0] | ConvertFrom-Json
         Ensure-CHRProperty -Object $meta.payload -Name "source" -Value "vscode"
         Ensure-CHRProperty -Object $meta.payload -Name "thread_source" -Value "user"
-        Ensure-CHRProperty -Object $meta.payload -Name "model_provider" -Value $Template.ModelProvider
+        Ensure-CHRProperty -Object $meta.payload -Name "model_provider" -Value $provider
         Ensure-CHRProperty -Object $meta.payload -Name "cli_version" -Value $Template.CliVersion
         Ensure-CHRProperty -Object $meta.payload -Name "dynamic_tools" -Value @($Template.DynamicTools)
         if ($ProjectJsonCwd) { Ensure-CHRProperty -Object $meta.payload -Name "cwd" -Value $ProjectJsonCwd }
         $lines[0] = $meta | ConvertTo-Json -Depth 100 -Compress
-        [System.IO.File]::WriteAllLines($rollout, $lines, [System.Text.UTF8Encoding]::new($false))
+        $jsonUpdates += [pscustomobject]@{ Path = $rollout; Lines = [string[]]$lines }
         $changed += [pscustomobject]@{ Id = $id; RolloutPath = $rollout; Title = $row.Title }
+    }
+    if ($dbStatements.Count -gt 0) {
+        Invoke-CHRSqlite -Database $Database -Sql (".bail on`nbegin immediate;`n" + (($dbStatements.ToArray()) -join "`n") + "`ncommit;") | Out-Null
+    }
+    foreach ($update in $jsonUpdates) {
+        Write-CHRAllLinesAtomic -Path $update.Path -Lines $update.Lines
     }
     return $changed
 }
